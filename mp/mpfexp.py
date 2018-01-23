@@ -30,6 +30,7 @@ import binascii
 import getpass
 import logging
 import subprocess
+import ast
 
 from mp.pyboard import Pyboard
 from mp.pyboard import PyboardError
@@ -38,6 +39,21 @@ from mp.contelnet import ConTelnet
 from mp.conwebsock import ConWebsock
 from mp.conbase import ConError
 from mp.retry import retry
+
+
+def _was_file_not_existing(exception):
+    """
+    Helper function used to check for ENOENT (file doesn't exist),
+    ENODEV (device doesn't exist, but handled in the same way) or
+    EINVAL errors in an exception. Treat them all the same for the
+    time being. TODO: improve and nuance.
+
+    :param  exception:      exception to examine
+    :return:                True if non-existing
+    """
+
+    stre = str(exception)
+    return any(err in stre for err in ('ENOENT', 'ENODEV', 'EINVAL', 'OSError:'))
 
 
 class RemoteIOError(IOError):
@@ -67,7 +83,7 @@ class MpFileExplorer(Pyboard):
         except Exception as e:
             raise ConError(e)
 
-        self.dir = "/"
+        self.dir = None
         self.sysname = None
         self.setup()
 
@@ -132,13 +148,7 @@ class MpFileExplorer(Pyboard):
         return con
 
     def _fqn(self, name):
-
-        if self.dir.endswith("/"):
-            fqn = self.dir + name
-        else:
-            fqn = self.dir + "/" + name
-
-        return fqn
+        return os.path.join(self.dir, name)
 
     def __set_sysname(self):
         self.sysname = self.eval("os.uname()[0]").decode('utf-8')
@@ -146,7 +156,7 @@ class MpFileExplorer(Pyboard):
     def close(self):
 
         Pyboard.close(self)
-        self.dir = "/"
+        self.dir = None
 
     def teardown(self):
 
@@ -157,6 +167,12 @@ class MpFileExplorer(Pyboard):
 
         self.enter_raw_repl()
         self.exec_("import os, sys, ubinascii")
+
+        # New version mounts files on /flash so lets set dir based on where we are in
+        # filesystem.
+        # Using the "path.join" to make sure we get "/" if "os.getcwd" returns "".
+        self.dir = os.path.join("/", self.eval("os.getcwd()").decode('utf8'))
+
         self.__set_sysname()
 
     @retry(PyboardError, tries=MAX_TRIES, delay=1, backoff=2, logger=logging.root)
@@ -167,14 +183,14 @@ class MpFileExplorer(Pyboard):
         try:
 
             res = self.eval("os.listdir('%s')" % self.dir)
-            tmp = eval(res)
+            tmp = ast.literal_eval(res.decode('utf-8'))
 
             if add_dirs:
                 for f in tmp:
                     try:
 
                         # if it is a dir, it could be listed with "os.listdir"
-                        self.eval("os.listdir('%s/%s')" % (self.dir, f))
+                        self.eval("os.listdir('%s/%s')" % (self.dir.rstrip('/'), f))
                         if add_details:
                             files.append((f, 'D'))
                         else:
@@ -182,7 +198,7 @@ class MpFileExplorer(Pyboard):
 
                     except PyboardError as e:
 
-                        if "ENOENT" in str(e):
+                        if _was_file_not_existing(e):
                             # this was not a dir
                             if self.sysname == "WiPy" and self.dir == "/":
                                 # for the WiPy, assume that all entries in the root of th FS
@@ -199,11 +215,11 @@ class MpFileExplorer(Pyboard):
                     try:
 
                         # if it is a file, "os.listdir" must fail
-                        self.eval("os.listdir('%s/%s')" % (self.dir, f))
+                        self.eval("os.listdir('%s/%s')" % (self.dir.rstrip('/'), f))
 
                     except PyboardError as e:
 
-                        if "ENOENT" in str(e):
+                        if _was_file_not_existing(e):
                             if add_details:
                                 files.append((f, 'F'))
                             else:
@@ -212,7 +228,7 @@ class MpFileExplorer(Pyboard):
                             raise e
 
         except Exception  as e:
-            if "ENOENT" in str(e):
+            if _was_file_not_existing(e):
                 raise RemoteIOError("No such directory: %s" % self.dir)
             else:
                 raise PyboardError(e)
@@ -223,14 +239,23 @@ class MpFileExplorer(Pyboard):
     def rm(self, target):
 
         try:
-            self.eval("os.remove('%s')" % self._fqn(target))
+            # 1st try to delete it as a file
+            self.eval("os.remove('%s')" % (self._fqn(target)))
         except PyboardError as e:
-            if "ENOENT" in str(e):
-                raise RemoteIOError("No such file or directory: %s" % target)
-            elif "EACCES" in str(e):
-                raise RemoteIOError("Directory not empty: %s" % target)
-            else:
-                raise e
+            try:
+                # 2nd see if it is empty dir
+                self.eval("os.rmdir('%s')" % (self._fqn(target)))
+            except PyboardError as e:
+                # 3rd report error if nor successful
+                if _was_file_not_existing(e):
+                    if self.sysname == "WiPy":
+                        raise RemoteIOError("No such file or directory or directory not empty: %s" % target)
+                    else:
+                        raise RemoteIOError("No such file or directory: %s" % target)
+                elif "EACCES" in str(e):
+                    raise RemoteIOError("Directory not empty: %s" % target)
+                else:
+                    raise e
 
     def mrm(self, pat, verbose=False):
 
@@ -269,7 +294,7 @@ class MpFileExplorer(Pyboard):
             self.exec_("f.close()")
 
         except PyboardError as e:
-            if "ENOENT" in str(e):
+            if _was_file_not_existing(e):
                 raise RemoteIOError("Failed to create file: %s" % dst)
             elif "EACCES" in str(e):
                 raise RemoteIOError("Existing directory: %s" % dst)
@@ -316,7 +341,7 @@ class MpFileExplorer(Pyboard):
             )
 
         except PyboardError as e:
-            if "ENOENT" in str(e):
+            if _was_file_not_existing(e):
                 raise RemoteIOError("Failed to read file: %s" % src)
             else:
                 raise e
@@ -356,7 +381,7 @@ class MpFileExplorer(Pyboard):
             )
 
         except PyboardError as e:
-            if "ENOENT" in str(e):
+            if _was_file_not_existing(e):
                 raise RemoteIOError("Failed to read file: %s" % src)
             else:
                 raise e
@@ -396,7 +421,7 @@ class MpFileExplorer(Pyboard):
             self.exec_("f.close()")
 
         except PyboardError as e:
-            if "ENOENT" in str(e):
+            if _was_file_not_existing(e):
                 raise RemoteIOError("Failed to create file: %s" % dst)
             elif "EACCES" in str(e):
                 raise RemoteIOError("Existing directory: %s" % dst)
@@ -420,7 +445,7 @@ class MpFileExplorer(Pyboard):
             self.dir = tmp_dir
 
         except PyboardError as e:
-            if "ENOENT" in str(e):
+            if _was_file_not_existing(e):
                 raise RemoteIOError("No such directory: %s" % target)
             else:
                 raise e
@@ -436,7 +461,7 @@ class MpFileExplorer(Pyboard):
             self.eval("os.mkdir('%s')" % self._fqn(target))
 
         except PyboardError as e:
-            if "ENOENT" in str(e):
+            if _was_file_not_existing(e):
                 raise RemoteIOError("Invalid directory name: %s" % target)
             elif "EEXIST" in str(e):
                 raise RemoteIOError("File or directory exists: %s" % target)

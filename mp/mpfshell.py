@@ -29,10 +29,10 @@ import os
 import argparse
 import colorama
 import glob
-import platform
 import sys
 import serial
 import logging
+import platform
 
 from mp import version
 from mp.mpfexp import MpFileExplorer
@@ -46,15 +46,18 @@ from mp.tokenizer import Tokenizer
 class MpFileShell(cmd.Cmd):
 
     def __init__(self, color=False, caching=False, reset=False):
+        if color:
+            colorama.init()
+            cmd.Cmd.__init__(self, stdout=colorama.initialise.wrapped_stdout)
+        else:
+            cmd.Cmd.__init__(self)
 
-        cmd.Cmd.__init__(self)
+        if platform.system() == 'Windows':
+            self.use_rawinput = False
 
         self.color = color
         self.caching = caching
         self.reset = reset
-
-        if self.color:
-            colorama.init()
 
         self.fe = None
         self.repl = None
@@ -111,6 +114,7 @@ class MpFileShell(cmd.Cmd):
             else:
                 self.fe = MpFileExplorer(port, self.reset)
             print("Connected to %s" % self.fe.sysname)
+            self.__set_prompt_path()
         except PyboardError as e:
             logging.error(e)
             self.__error(str(e))
@@ -375,7 +379,7 @@ class MpFileShell(cmd.Cmd):
         Upload all local files that match the given regular expression.
         The remote files will be named the same as the local files.
 
-        "mput" does not get directories, and it is note recursive.
+        "mput" does not get directories, and it is not recursive.
         """
 
         if not len(args):
@@ -424,7 +428,7 @@ class MpFileShell(cmd.Cmd):
         Download all remote files that match the given regular expression.
         The local files will be named the same as the remote files.
 
-        "mget" does not get directories, and it is note recursive.
+        "mget" does not get directories, and it is not recursive.
         """
 
         if not len(args):
@@ -475,7 +479,7 @@ class MpFileShell(cmd.Cmd):
         """mrm <SELECTION REGEX>
         Delete all remote files that match the given regular expression.
 
-        "mrm" does not delete directories, and it is note recursive.
+        "mrm" does not delete directories, and it is not recursive.
         """
 
         if not len(args):
@@ -526,6 +530,7 @@ class MpFileShell(cmd.Cmd):
         """
 
         def data_consumer(data):
+            data = str(data.decode('utf-8'))
             sys.stdout.write(data.strip("\x04"))
 
         if not len(args):
@@ -637,6 +642,10 @@ def main():
 
     parser.add_argument("--reset", help="hard reset device via DTR (serial connection only)", action="store_true",
                         default=False)
+    
+    parser.add_argument("-o", "--open", help="directly opens board", metavar="BOARD", action="store", default=None)
+    parser.add_argument("board", help="directly opens board", nargs="?", action="store", default=None)
+    
 
     args = parser.parse_args()
 
@@ -652,6 +661,15 @@ def main():
               % (sys.version_info[0], sys.version_info[1], serial.VERSION))
 
     mpfs = MpFileShell(not args.nocolor, not args.nocache, args.reset)
+    
+    if args.open is not None:
+        if args.board is None:
+            mpfs.do_open(args.open)
+        else:
+            print("Positional argument ({}) takes precedence over --open.".format(args.board))
+    if args.board is not None:
+        mpfs.do_open(args.board)
+    
 
     if args.command is not None:
 
